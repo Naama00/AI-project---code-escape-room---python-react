@@ -1,0 +1,46 @@
+@import "tailwindcss";
+@layer base {
+  body {
+    @apply bg-slate-50 text-slate-900;
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+  }
+}
+
+@layer components {
+  /* עיצוב כללי לכרטיס (Card) */
+  .game-card {
+    @apply bg-white p-6 rounded-3xl shadow-lg border border-slate-100;
+  }
+
+  /* כותרות משנה */
+  .section-title {
+    @apply text-xl font-bold text-slate-800 mb-4 flex items-center gap-2;
+  }
+
+  /* עיצוב עורך הקוד */
+  .code-editor {
+    @apply w-full h-96 p-4 font-mono text-sm rounded-2xl border-2 border-sky-100 bg-slate-950 text-sky-300 focus:border-sky-300 focus:ring-2 focus:ring-sky-200 resize-none outline-none transition;
+  }
+
+  /* כפתורים */
+  .btn-primary {
+    @apply px-6 py-3 rounded-full font-bold text-white transition-all duration-200 transform hover:scale-105 active:scale-95;
+    background: linear-gradient(135deg, #60a5fa 0%, #3b82f6 100%);
+    box-shadow: 0 4px 6px -1px rgba(59, 130, 246, 0.4);
+  }
+
+  .btn-success {
+    @apply px-6 py-3 rounded-full font-bold text-white bg-green-500 hover:bg-green-600 transition-all duration-200 transform hover:scale-105;
+  }
+
+  /* אנימציות */
+  .float {
+    animation: float 3s ease-in-out infinite;
+  }
+
+  @keyframes float {
+    0% { transform: translateY(0px); }
+    50% { transform: translateY(-10px); }
+    100% { transform: translateY(0px); }
+  }
+}
