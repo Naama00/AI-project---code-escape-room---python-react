@@ -15,7 +15,7 @@ function App() {
   useEffect(() => {
     const fetchTask = async () => {
       try {
-        const response = await fetch(`http://localhost:8000/get-task/${taskId}`);
+const response = await fetch(`http://localhost:5000/get-task/${taskId}`);
         const data = await response.json();
         setCurrentTask(data);
         setCode(data.bad_code); // Populate editor with bad code
@@ -40,7 +40,7 @@ function App() {
   const submitCode = async () => {
     setIsLoading(true);
     try {
-      const response = await fetch('http://127.0.0.1:8000/analyze-code', {
+      const response = await fetch('http://localhost:5000/analyze-code', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',

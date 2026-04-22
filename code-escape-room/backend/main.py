@@ -1,8 +1,10 @@
 # SSL workaround for corporate/proxy environments - MUST be before imports
 import os
+import time
+from collections import defaultdict
 os.environ['REQUESTS_CA_BUNDLE'] = ''
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 import requests
@@ -20,56 +22,92 @@ logger = logging.getLogger(__name__)
 # טעינת משתני הסביבה מקובץ .env
 load_dotenv()
 
-logger.info(f"GOOGLE_API_KEY loaded: {os.getenv('GOOGLE_API_KEY')[:20]}..." if os.getenv("GOOGLE_API_KEY") else "GOOGLE_API_KEY not found")
+logger.info(f"GOOGLE_CSE_ID loaded: {os.getenv('GOOGLE_CSE_ID')[:20]}..." if os.getenv("GOOGLE_CSE_ID") else "GOOGLE_CSE_ID not found")
 
-# Google Gemini API helper function
+# ========== הגדרות מגבלות ==========
+MAX_CODE_LENGTH = 1000        # תווים מקסימליים בקוד
+MAX_REQUESTS_PER_MINUTE = 5   # בקשות מקסימליות לדקה לכל IP
+MIN_SECONDS_BETWEEN_REQUESTS = 5  # שניות מינימום בין בקשות לכל IP
+
+# מעקב אחר בקשות לפי IP
+request_timestamps = defaultdict(list)  # IP -> רשימת timestamps
+
+def check_rate_limit(ip: str):
+    """בודק אם ה-IP עבר את מגבלת הבקשות"""
+    now = time.time()
+    timestamps = request_timestamps[ip]
+    
+    # הסר timestamps ישנים (מעל דקה)
+    request_timestamps[ip] = [t for t in timestamps if now - t < 60]
+    timestamps = request_timestamps[ip]
+    
+    # בדוק מגבלת בקשות לדקה
+    if len(timestamps) >= MAX_REQUESTS_PER_MINUTE:
+        raise HTTPException(
+            status_code=429,
+            detail=f"יותר מדי בקשות. מותר {MAX_REQUESTS_PER_MINUTE} בקשות לדקה."
+        )
+    
+    # בדוק מגבלת זמן בין בקשות
+    if timestamps and (now - timestamps[-1]) < MIN_SECONDS_BETWEEN_REQUESTS:
+        wait = int(MIN_SECONDS_BETWEEN_REQUESTS - (now - timestamps[-1])) + 1
+        raise HTTPException(
+            status_code=429,
+            detail=f"המתן {wait} שניות לפני הבקשה הבאה."
+        )
+    
+    # רשום את הבקשה הנוכחית
+    request_timestamps[ip].append(now)
+
+# ========== API Keys rotation ==========
+API_KEYS = [
+    os.getenv("GOOGLE_CSE_ID"),
+    os.getenv("SECOND_GOOGLE_API_KEY"),
+]
+current_key_index = 0
+model = any(API_KEYS)
+
 def gemini_api_call(prompt):
-    """Call Google Gemini REST API directly"""
-    api_key = os.getenv("GOOGLE_API_KEY")
-    url = f"https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent?key={api_key}"
+    """Call Google Gemini REST API with automatic key rotation"""
+    global current_key_index
     
-    headers = {
-        "Content-Type": "application/json",
-    }
+    for attempt in range(len(API_KEYS)):
+        api_key = API_KEYS[current_key_index]
+        if not api_key:
+            current_key_index = (current_key_index + 1) % len(API_KEYS)
+            continue
+            
+        url = f"https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent?key={api_key}"
+        headers = {"Content-Type": "application/json"}
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}]
+        }
+        
+        response = requests.post(url, json=payload, headers=headers, verify=False)
+        
+        if response.status_code in (429, 503):
+            logger.warning(f"Key {current_key_index} returned {response.status_code}, switching to next key")
+            current_key_index = (current_key_index + 1) % len(API_KEYS)
+            time.sleep(3)
+            continue
+        
+        result = response.json()
+        if "candidates" in result and len(result["candidates"]) > 0:
+            return result["candidates"][0]["content"]["parts"][0]["text"]
+        else:
+            raise Exception(f"Unexpected API response: {result}")
     
-    payload = {
-        "contents": [{
-            "parts": [{
-                "text": prompt
-            }]
-        }]
-    }
-    
-    # Disable SSL verification for corporate proxy
-    response = requests.post(url, json=payload, headers=headers, verify=False)
-    result = response.json()
-    
-    if "candidates" in result and len(result["candidates"]) > 0:
-        return result["candidates"][0]["content"]["parts"][0]["text"]
-    else:
-        raise Exception(f"Unexpected API response: {result}")
-
-# Initialize model status
-try:
-    api_key = os.getenv("GOOGLE_API_KEY")
-    if api_key:
-        model = True
-        logger.info("Google Gemini client initialized successfully")
-    else:
-        logger.error("Google API key not found")
-        model = None
-except Exception as e:
-    logger.error(f"Failed to initialize Gemini client: {e}")
-    model = None
+    raise Exception("All API keys exhausted or unavailable")
 
 app = FastAPI()
+
 @app.get("/")
 def read_root():
     return {"message": "Welcome to the Coding Escape Room API"}
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # לצרכי פיתוח בלבד
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -78,43 +116,78 @@ class CodeSubmission(BaseModel):
     code: str
     task_id: int | None = None
 
-
 @app.post("/analyze-code")
-async def analyze_code(submission: CodeSubmission):
+async def analyze_code(submission: CodeSubmission, request: Request):
+    # בדיקת rate limit לפי IP
+    client_ip = request.client.host
+    check_rate_limit(client_ip)
+
+    # בדיקת אורך קוד
+    if len(submission.code.strip()) == 0:
+        raise HTTPException(status_code=400, detail="הקוד ריק.")
+    
+    if len(submission.code) > MAX_CODE_LENGTH:
+        raise HTTPException(
+            status_code=400,
+            detail=f"הקוד ארוך מדי. מקסימום {MAX_CODE_LENGTH} תווים."
+        )
+
     try:
         print("--- קיבלתי בקשה מה-Frontend ---")
         if not model:
             print("--- שגיאה: Gemini Model לא אותחל ---")
             raise HTTPException(status_code=500, detail="Gemini model not initialized")
         
-        # Create prompt for code analysis with structured output request
         prompt = f"""
-בחן את הקוד הבא בהקשר של משימת שיפור קוד (Refactoring).
-תן משוב לימודי, מפורט ומעודד בעברית.
+אתה מנהל משחק לימודי. בחן את הקוד הבא בהקשר של משימת שיפור קוד (Refactoring).
+המטרה: להחזיר משוב לימודי, מפורט מאוד, ומעודד בעברית.
+התמקד בביצועים, קריאות, ועקרונות SOLID.
 
 קוד המשתמש:
 {submission.code}
 
-תשוב בפורמט JSON בלבד (ללא טקסט נוסף לפני או אחרי):
-{{
-  "score": <מספר 1-10>,
-  "feedback": "<פירוט מילולי: מה עובד טוב, מה לא קריא, אילו עקרונות SOLID הופרו או יושמו>",
-  "hint": "<רמז ספציפי כיצד לשפר את הקוד>",
-  "is_solved": <true או false>
-}}
-""" # <--- הוספתי את הסגירה החסרה כאן!
+---
+הוראות נוקשות:
+1. אל תחזיר את הכותרת של המשימה כמשוב.
+2. התייחס ספציפית למה שהמשתמש כתב בקוד לעומת מה שהיה צריך לכתוב.
+---
 
-        # Call Gemini API
+תשוב בפורמט JSON בלבד (ללא טקסט נוסף לפני או אחרי), והנה דוגמה למבנה הרצוי:
+{{
+  "score": 85,
+  "feedback": "הקוד שלך נכון מבחינה לוגית, אך השתמשת במשתנה בוליאני מיותר. ניתן להחזיר את התוצאה ישירות.",
+  "hint": "בדוק האם תוכל להחזיר את הביטוי (num % 2 == 0) ללא שימוש ב-if או משתנה נוסף.",
+  "is_solved": false
+}}
+"""
         feedback_text = gemini_api_call(prompt)
         
-        # Try to extract JSON from the response
+        feedback_data = {
+            "score": 0,
+            "feedback": "לא ניתן היה לנתח את התשובה מה-AI.",
+            "hint": "נסה לשלוח את הקוד שוב.",
+            "is_solved": False
+        }
+        
         try:
             import json
-            # ... (שאר הלוגיקה של ה-JSON נשארת אותו דבר) ...
+            if "```json" in feedback_text:
+                json_start = feedback_text.find("```json") + 7
+                json_end = feedback_text.find("```", json_start)
+                json_str = feedback_text[json_start:json_end].strip()
+            elif "```" in feedback_text:
+                json_start = feedback_text.find("```") + 3
+                json_end = feedback_text.find("```", json_start)
+                json_str = feedback_text[json_start:json_end].strip()
+            else:
+                json_str = feedback_text
+            
+            parsed_data = json.loads(json_str)
+            feedback_data.update(parsed_data)
             
         except json.JSONDecodeError:
-            # ...
-            pass # (לצורך הדוגמה)
+            print("--- שגיאה: לא ניתן לפענח JSON ---")
+            feedback_data["feedback"] = feedback_text
         
         return {
             "status": "success",
@@ -127,8 +200,7 @@ async def analyze_code(submission: CodeSubmission):
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
-
-
+    
 TASKS = {
     1: {
         "title": "חישוב מע\"מ מבלבל",
@@ -189,11 +261,6 @@ def get_task(task_id: int):
         raise HTTPException(status_code=404, detail="Task not found")
     return task
 
-
-
-
-
-
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=5000)
